@@ -1,0 +1,493 @@
+name: Build Sundarban Drug House APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install TypeScript
+        run: npm install -D typescript
+
+      - name: Install Capacitor Android
+        run: npm install @capacitor/android@8.5.2
+
+      # Backup File খুঁজুন বাটন নিশ্চিত করা
+      - name: Fix Backup File selector
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("script1.js")
+          s = p.read_text(encoding="utf-8")
+
+          old = '<label class="btn secondary">Restore<input type="file" accept=".json" hidden onchange="restoreBackup(this.files[0])"></label>'
+
+          new = '<button class="btn secondary" onclick="selectBackupFile()">📂 Backup File খুঁজুন</button>'
+
+          if old in s:
+              s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding="utf-8")
+          print("Backup File selector checked/fixed.")
+
+          PY
+
+      - name: Build web application
+        run: npm run build
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Configure Android native bridge
+        shell: bash
+        run: |
+          set -e
+
+          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java" | head -n 1)
+
+          if [ -z "$MAIN_ACTIVITY" ]; then
+            echo "MainActivity.java not found"
+            exit 1
+          fi
+
+          PACKAGE_PATH=$(dirname "$MAIN_ACTIVITY" | sed 's#android/app/src/main/java/##')
+          PACKAGE_NAME=$(echo "$PACKAGE_PATH" | tr '/' '.')
+
+          cat > "$MAIN_ACTIVITY" <<EOF
+          package $PACKAGE_NAME;
+
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+
+          import androidx.appcompat.app.AlertDialog;
+
+          import com.getcapacitor.BridgeActivity;
+
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          public class MainActivity extends BridgeActivity {
+
+              private static final int FOLDER_REQUEST = 9017;
+              private static final int FILE_REQUEST = 9018;
+
+              private android.content.SharedPreferences prefs;
+              private boolean isExitDialogShowing = false;
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  prefs = getSharedPreferences("sdh_backup", MODE_PRIVATE);
+
+                  if (getBridge() != null &&
+                      getBridge().getWebView() != null) {
+
+                      getBridge().getWebView()
+                          .addJavascriptInterface(
+                              new BackupBridge(),
+                              "Android"
+                          );
+                  }
+              }
+
+              public class BackupBridge {
+
+                  @JavascriptInterface
+                  public void selectBackupFolder() {
+
+                      Intent intent =
+                          new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+
+                      intent.addFlags(
+                          Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                          Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                          Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                      );
+
+                      startActivityForResult(
+                          intent,
+                          FOLDER_REQUEST
+                      );
+                  }
+
+                  @JavascriptInterface
+                  public void selectBackupFile() {
+
+                      Intent intent =
+                          new Intent(Intent.ACTION_OPEN_DOCUMENT);
+
+                      intent.addCategory(
+                          Intent.CATEGORY_OPENABLE
+                      );
+
+                      intent.setType("application/json");
+
+                      intent.addFlags(
+                          Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                          Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                      );
+
+                      startActivityForResult(
+                          intent,
+                          FILE_REQUEST
+                      );
+                  }
+
+                  @JavascriptInterface
+                  public String readSelectedBackup() {
+
+                      try {
+
+                          String raw =
+                              prefs.getString(
+                                  "backup_file_uri",
+                                  null
+                              );
+
+                          if (raw == null) {
+                              return "";
+                          }
+
+                          Uri uri = Uri.parse(raw);
+
+                          InputStream in =
+                              getContentResolver()
+                                  .openInputStream(uri);
+
+                          if (in == null) {
+                              return "";
+                          }
+
+                          ByteArrayOutputStream out =
+                              new ByteArrayOutputStream();
+
+                          byte[] buffer =
+                              new byte[8192];
+
+                          int n;
+
+                          while ((n = in.read(buffer)) != -1) {
+                              out.write(buffer, 0, n);
+                          }
+
+                          in.close();
+
+                          return out.toString("UTF-8");
+
+                      } catch (Exception e) {
+
+                          return "";
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void saveBackup(
+                      String json,
+                      String name
+                  ) {
+
+                      try {
+
+                          String raw =
+                              prefs.getString(
+                                  "backup_tree_uri",
+                                  null
+                              );
+
+                          if (raw == null) {
+                              return;
+                          }
+
+                          Uri tree =
+                              Uri.parse(raw);
+
+                          Uri file =
+                              android.provider.DocumentsContract
+                                  .createDocument(
+                                      getContentResolver(),
+                                      tree,
+                                      "application/json",
+                                      name
+                                  );
+
+                          if (file == null) {
+                              return;
+                          }
+
+                          OutputStream out =
+                              getContentResolver()
+                                  .openOutputStream(file);
+
+                          if (out == null) {
+                              return;
+                          }
+
+                          out.write(
+                              json.getBytes("UTF-8")
+                          );
+
+                          out.close();
+
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(
+                  int requestCode,
+                  int resultCode,
+                  Intent data
+              ) {
+
+                  super.onActivityResult(
+                      requestCode,
+                      resultCode,
+                      data
+                  );
+
+                  if (
+                      requestCode == FILE_REQUEST &&
+                      resultCode == RESULT_OK &&
+                      data != null &&
+                      data.getData() != null
+                  ) {
+
+                      Uri uri = data.getData();
+
+                      try {
+
+                          int flags =
+                              data.getFlags()
+                              & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+
+                          getContentResolver()
+                              .takePersistableUriPermission(
+                                  uri,
+                                  flags
+                              );
+
+                      } catch (Exception ignored) {
+                      }
+
+                      prefs.edit()
+                          .putString(
+                              "backup_file_uri",
+                              uri.toString()
+                          )
+                          .apply();
+
+                      try {
+
+                          WebView w =
+                              getBridge() == null
+                              ? null
+                              : getBridge().getWebView();
+
+                          if (w != null) {
+
+                              w.post(() ->
+                                  w.evaluateJavascript(
+                                      "window.onNativeBackupFileSelected && window.onNativeBackupFileSelected();",
+                                      null
+                                  )
+                              );
+                          }
+
+                      } catch (Exception ignored) {
+                      }
+
+                      return;
+                  }
+
+                  if (
+                      requestCode == FOLDER_REQUEST &&
+                      resultCode == RESULT_OK &&
+                      data != null &&
+                      data.getData() != null
+                  ) {
+
+                      Uri uri = data.getData();
+
+                      try {
+
+                          int flags =
+                              data.getFlags()
+                              & (
+                                  Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                                  Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                              );
+
+                          getContentResolver()
+                              .takePersistableUriPermission(
+                                  uri,
+                                  flags
+                              );
+
+                      } catch (Exception ignored) {
+                      }
+
+                      prefs.edit()
+                          .putString(
+                              "backup_tree_uri",
+                              uri.toString()
+                          )
+                          .apply();
+
+                      String name =
+                          "নির্বাচিত Backup Folder";
+
+                      try {
+
+                          String path =
+                              uri.getPath();
+
+                          if (path != null) {
+                              name = path;
+                          }
+
+                      } catch (Exception ignored) {
+                      }
+
+                      try {
+
+                          WebView w =
+                              getBridge() == null
+                              ? null
+                              : getBridge().getWebView();
+
+                          if (w != null) {
+
+                              String js =
+                                  "window.onNativeBackupFolderSelected && " +
+                                  "window.onNativeBackupFolderSelected(" +
+                                  JSONObject.quote(name) +
+                                  ");";
+
+                              w.post(() ->
+                                  w.evaluateJavascript(
+                                      js,
+                                      null
+                                  )
+                              );
+                          }
+
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+
+                  WebView webView = null;
+
+                  try {
+
+                      if (getBridge() != null) {
+                          webView =
+                              getBridge().getWebView();
+                      }
+
+                  } catch (Exception ignored) {
+                  }
+
+                  if (
+                      webView != null &&
+                      webView.canGoBack()
+                  ) {
+
+                      webView.goBack();
+                      return;
+                  }
+
+                  if (isExitDialogShowing) {
+                      return;
+                  }
+
+                  isExitDialogShowing = true;
+
+                  new AlertDialog.Builder(this)
+                      .setTitle("অ্যাপ থেকে বের হবেন?")
+                      .setMessage(
+                          "আপনি কি সত্যিই অ্যাপ থেকে বের হতে চান?"
+                      )
+                      .setPositiveButton(
+                          "হ্যাঁ",
+                          (d, w) -> {
+                              isExitDialogShowing = false;
+                              finishAndRemoveTask();
+                          }
+                      )
+                      .setNegativeButton(
+                          "না",
+                          (d, w) -> {
+                              isExitDialogShowing = false;
+                              d.dismiss();
+                          }
+                      )
+                      .setOnCancelListener(
+                          d -> isExitDialogShowing = false
+                      )
+                      .show();
+              }
+          }
+          EOF
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Make Gradle executable
+        run: chmod +x android/gradlew
+
+      - name: Build Debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "APK was not created."
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sundarban-Drug-House-FINAL-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
