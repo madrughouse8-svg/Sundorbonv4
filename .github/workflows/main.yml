@@ -123,8 +123,7 @@ jobs:
           import android.webkit.JavascriptInterface;
           import android.webkit.WebView;
 
-          import androidx.appcompat.app.AlertDialog;
-
+          import android.app.AlertDialog;
           import com.getcapacitor.BridgeActivity;
 
           import org.json.JSONObject;
